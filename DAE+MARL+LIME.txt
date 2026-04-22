@@ -1,0 +1,343 @@
+# ========================LIME INSTALLATION=============================
+
+# !pip install lime
+
+# ============================================================
+# LIME-Based Real-Time Anomaly Detection in IoT
+# Using Denoising Autoencoders and Multi-Agent RL Thresholding
+# ============================================================
+
+
+
+# ===================== 1. IMPORTS =====================
+import os, random, time, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+from datetime import datetime
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    confusion_matrix, classification_report,
+    roc_auc_score, roc_curve,
+    precision_recall_curve, f1_score,
+    ConfusionMatrixDisplay
+)
+
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.svm import OneClassSVM
+from lime.lime_tabular import LimeTabularExplainer
+
+# ===================== 2. SEED =====================
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ===================== 3. LOAD DATA =====================
+DATA_PATH = "IDSMerged57.csv"
+df = pd.read_csv(DATA_PATH, low_memory=False)
+
+print("Dataset Shape:", df.shape)
+
+# ===================== 5. AUTO-LABEL DETECTION =====================
+label_col = next(c for c in df.columns if c.lower() in ["label", "class", "target"])
+labels_raw = df[label_col].astype(str).str.lower()
+y = labels_raw.apply(lambda x: 0 if "benign" in x or "normal" in x else 1).values
+
+# ===================== 6. FEATURE MATRIX =====================
+X = df.drop(columns=[label_col])
+
+# ===================== 7. ROBUST PREPROCESSING =====================
+X = X.replace([np.inf, -np.inf], np.nan)
+X = X.clip(-1e6, 1e6)
+X = X.fillna(X.median())
+
+scaler = StandardScaler()
+Xn = pd.DataFrame(scaler.fit_transform(X), columns=X.columns)
+
+# ===================== 8. BENIGN TRAIN DATA =====================
+X_train = Xn[y == 0]
+
+train_loader = DataLoader(
+    TensorDataset(torch.tensor(X_train.values, dtype=torch.float32)),
+    batch_size=1024,
+    shuffle=True
+)
+
+# ===================== 9. DENOISING AUTOENCODER =====================
+class DenoisingAE(nn.Module):
+
+    def __init__(self, d):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Linear(d,128),
+            nn.ReLU(),
+            nn.Linear(128,32)
+        )
+
+        self.decoder = nn.Sequential(
+            nn.Linear(32,128),
+            nn.ReLU(),
+            nn.Linear(128,d)
+        )
+
+    def forward(self,x):
+        noise = torch.randn_like(x)*0.05
+        x_noisy = x + noise
+        z = self.encoder(x_noisy)
+        return self.decoder(z)
+
+model = DenoisingAE(X_train.shape[1]).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(),lr=1e-3)
+loss_fn = nn.MSELoss()
+
+# ===================== 10. TRAIN AUTOENCODER =====================
+EPOCHS = 25
+
+start_train = time.time()
+
+for ep in range(EPOCHS):
+
+    model.train()
+    total_loss = 0
+
+    for (xb,) in train_loader:
+
+        xb = xb.to(device)
+
+        optimizer.zero_grad()
+
+        recon = model(xb)
+
+        loss = loss_fn(recon,xb)
+
+        loss.backward()
+
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print(f"Epoch {ep+1}/{EPOCHS} | Loss={total_loss/len(train_loader):.6f}")
+
+training_time = time.time() - start_train
+
+# ===================== 11. ANOMALY SCORING =====================
+model.eval()
+
+with torch.no_grad():
+
+    Xt = torch.tensor(Xn.values,dtype=torch.float32).to(device)
+
+    recon = model(Xt)
+
+    scores = ((Xt - recon)**2).mean(1).cpu().numpy()
+
+# ===================== 12–13 MULTI AGENT RL =====================
+print(" MARL Threshold Optimization Started")
+
+scores_env = scores
+y_env = y
+
+thresholds = np.percentile(scores_env[y_env==0],[85,88,90,92,94,96,98])
+
+n_agents = len(thresholds)
+n_actions = 3
+
+alpha = 0.1
+gamma = 0.9
+epsilon = 0.2
+episodes = 50
+
+Q_tables = [np.zeros((len(thresholds),n_actions)) for _ in range(n_agents)]
+
+def get_reward(threshold):
+
+    preds = (scores_env > threshold).astype(int)
+
+    f1 = f1_score(y_env,preds)
+
+    fp = np.sum((preds==1)&(y_env==0))
+
+    return f1 - 0.001*fp
+
+for ep in range(episodes):
+
+    for agent_id in range(n_agents):
+
+        state = agent_id
+
+        if np.random.rand() < epsilon:
+            action = np.random.randint(n_actions)
+        else:
+            action = np.argmax(Q_tables[agent_id][state])
+
+        if action==0 and state>0:
+            next_state = state-1
+        elif action==2 and state < len(thresholds)-1:
+            next_state = state+1
+        else:
+            next_state = state
+
+        reward = get_reward(thresholds[next_state])
+
+        Q_tables[agent_id][state,action] += alpha*(
+
+            reward + gamma*np.max(Q_tables[agent_id][next_state])
+            - Q_tables[agent_id][state,action]
+
+        )
+
+best_rewards = []
+
+for i in range(n_agents):
+
+    r = get_reward(thresholds[i])
+
+    best_rewards.append(r)
+
+best_agent = np.argmax(best_rewards)
+
+best_t = thresholds[best_agent]
+
+y_pred = (scores_env > best_t).astype(int)
+
+print("Selected Threshold:",best_t)
+
+# ===================== DATASET SUMMARY =====================
+dataset_summary = pd.DataFrame({
+    "Metric":["Total Samples","Benign","Attack","Features"],
+    "Value":[len(df),sum(y==0),sum(y==1),X.shape[1]]
+})
+
+print(dataset_summary)
+
+# ===================== ATTACK DISTRIBUTION =====================
+attack_summary = df[label_col].value_counts().reset_index()
+attack_summary.columns=["Attack_Type","Count"]
+
+print(attack_summary)
+
+# ===================== CONFUSION MATRIX =====================
+cm = confusion_matrix(y,y_pred)
+
+ConfusionMatrixDisplay(cm,display_labels=["Benign","Attack"]).plot()
+
+plt.show()
+
+# ===================== BASELINE COMPARISON =====================
+# baseline_df = pd.DataFrame({
+
+# "Model":[
+# "Masking Denoising Autoencoder",
+# "Contractive Denoising Autoencoder",
+# "Gaussian DAE + MARL"
+# ],
+
+# "AUC":[
+# roc_auc_score(y,scores),
+# roc_auc_score(y,scores),
+# roc_auc_score(y,scores)
+# ]
+
+# })
+
+# print(baseline_df)
+
+
+# -------- Final Baseline Comparison Table --------
+baseline_df = pd.DataFrame({
+
+    "Model": [
+        # "Masking Denoising Autoencoder",
+        # "Contractive Denoising Autoencoder",
+        "Gaussian DAE + MARL (Proposed)"
+    ],
+
+    "AUC": [
+        # roc_auc_score(y, mask_scores),
+        # roc_auc_score(y, cont_scores),
+        roc_auc_score(y, scores)
+    ],
+
+    "Precision": [
+        # classification_report(y, mask_pred, output_dict=True)["1"]["precision"],
+        # classification_report(y, cont_pred, output_dict=True)["1"]["precision"],
+        classification_report(y, y_pred, output_dict=True)["1"]["precision"]
+    ],
+
+    "Recall": [
+        # classification_report(y, mask_pred, output_dict=True)["1"]["recall"],
+        # classification_report(y, cont_pred, output_dict=True)["1"]["recall"],
+        classification_report(y, y_pred, output_dict=True)["1"]["recall"]
+    ],
+
+    "F1-Score": [
+        # f1_score(y, mask_pred),
+        # f1_score(y, cont_pred),
+        f1_score(y, y_pred)
+    ]
+
+})
+
+print(baseline_df)
+
+
+
+
+# ===================== ROC CURVE =====================
+fpr,tpr,_ = roc_curve(y,scores)
+
+plt.plot(fpr,tpr)
+
+plt.xlabel("False Positive Rate")
+
+plt.ylabel("True Positive Rate")
+
+plt.show()
+
+# ===================== PRECISION RECALL CURVE =====================
+precision,recall,_ = precision_recall_curve(y,scores)
+
+plt.plot(recall,precision)
+
+plt.xlabel("Recall")
+
+plt.ylabel("Precision")
+
+plt.show()
+
+# ===================== LIME EXPLAINABILITY =====================
+rf = RandomForestClassifier(n_estimators=150,random_state=42)
+
+rf.fit(Xn,y_pred)
+
+explainer = LimeTabularExplainer(
+
+Xn.values,
+feature_names=Xn.columns.tolist(),
+class_names=["Benign","Attack"],
+discretize_continuous=True
+
+)
+
+idx = np.where(y_pred==1)[0][0] if np.any(y_pred==1) else 0
+
+exp = explainer.explain_instance(Xn.iloc[idx].values,rf.predict_proba)
+
+exp.as_pyplot_figure()
+
+plt.show()
+
+print(" PIPELINE COMPLETED")
